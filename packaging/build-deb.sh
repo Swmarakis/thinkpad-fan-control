@@ -47,7 +47,13 @@ Description: Automatic fan-speed control for ThinkPad laptops
  for low fan levels, and a thermal safety override (hardware watchdog + a
  critical-temperature full-speed override).
  .
- Developed and tested on the ThinkPad L490 (Ubuntu 24.04).
+ On NVIDIA-equipped ThinkPads the GPU temperature is an optional second source
+ with its own curve and critical limit; the fan follows whichever of CPU or GPU
+ asks for more cooling. It is read through the driver's own NVML library, so no
+ extra package is required.
+ .
+ Developed and tested on the ThinkPad L490 (Ubuntu 24.04) and the ThinkPad
+ P1 Gen 7 with an RTX 4060 Laptop GPU (Pop!_OS).
 EOF
 
 # --- maintainer scripts ---------------------------------------------------- #
