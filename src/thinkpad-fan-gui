@@ -3,26 +3,36 @@
 thinkpad-fan-gui - desktop control panel for thinkpad-fand.
 
 Runs as the normal user (no root). It:
-  * shows live CPU temperature, fan RPM and the level the firmware reports,
+  * shows live CPU and (optional) NVIDIA GPU temperature, every fan RPM the
+    machine reports, the selected level and which sensor asked for it,
   * lets you pick a mode (Auto curve / Manual / BIOS) and a manual level,
-  * edits the auto temperature curve on an interactive graph (drag points;
-    X = fan speed %, Y = temperature) plus presets / numeric boxes,
+  * edits the CPU and GPU temperature curves - one tab each - on an interactive
+    graph (drag points; X = fan speed %, Y = temperature) plus presets / boxes,
   * toggles "launch at login" (XDG autostart),
   * writes the user-owned config that the root daemon watches.
 
 All writes go to a plain JSON file; the daemon does the privileged work.
+Live figures come from the daemon's status snapshot when it is running, so the
+panel shows exactly what the daemon decided; otherwise the sensors are read
+directly here as a fallback.
 """
 
+import ctypes
 import json
 import os
 import sys
+import time
 import glob
 import tkinter as tk
 from tkinter import ttk, messagebox
 
 CONFIG_PATH = "/etc/thinkpad-fan/config.json"
+STATUS_PATH = "/run/thinkpad-fan/status.json"
 FAN_PROC = "/proc/acpi/ibm/fan"
 SERVICE = "thinkpad-fand"
+
+# A status snapshot older than this is treated as stale (daemon stopped/hung).
+STATUS_MAX_AGE = 10
 
 # Temperature range shown on the curve graph's Y axis.
 TEMP_MIN, TEMP_MAX = 20, 95
@@ -50,6 +60,9 @@ DEFAULT_CONFIG = {
     "poll_interval": 2,
     "smoothing_seconds": 12,
     "rekick_seconds": 5,
+    "gpu_monitoring": "auto",
+    "gpu_curve": [[0, 0], [60, 1], [65, 2], [70, 3], [74, 4], [78, 5], [82, 6], [85, 7]],
+    "gpu_critical_temp": 90,
 }
 
 # Auto-curve presets: temperature at which each of levels 1..7 engages.
@@ -57,6 +70,14 @@ PRESETS = {
     "Quiet":    [56, 63, 69, 74, 79, 83, 86],
     "Balanced": [50, 57, 63, 69, 75, 80, 84],
     "Cool":     [42, 48, 54, 60, 66, 72, 78],
+}
+
+# GPUs idle cooler and are specified to run hotter than CPUs, so they get their
+# own presets rather than reusing the CPU ones.
+GPU_PRESETS = {
+    "Quiet":    [65, 70, 75, 79, 83, 86, 89],
+    "Balanced": [60, 65, 70, 74, 78, 82, 85],
+    "Cool":     [50, 55, 60, 65, 70, 75, 80],
 }
 
 
@@ -97,6 +118,108 @@ def read_cpu_temp():
             return int(round(t))
     t = _max_temp(glob.glob("/sys/class/hwmon/hwmon*"))
     return int(round(t)) if t is not None else None
+
+
+def read_gpu_temp():
+    """Best-effort NVIDIA GPU temperature, used only when the daemon's status
+    snapshot isn't available. The daemon has the authoritative reader; this is a
+    trimmed version of it (NVML, then a GPU hwmon, then the ThinkPad EC sensor)
+    with no subprocess fallback - the panel is not safety-critical."""
+    try:
+        for d in glob.glob("/sys/bus/pci/devices/*"):
+            with open(os.path.join(d, "vendor")) as f:
+                if f.read().strip().lower() != "0x10de":
+                    continue
+            with open(os.path.join(d, "class")) as f:
+                if not f.read().strip().lower().startswith("0x03"):
+                    continue
+            try:
+                with open(os.path.join(d, "power", "runtime_status")) as f:
+                    if f.read().strip() == "suspended":
+                        continue          # powered down: don't wake it just to look
+            except OSError:
+                pass
+            t = _read_nvml_temp()
+            if t is not None:
+                return int(round(t))
+            break
+    except OSError:
+        pass
+    t = _max_temp(_hwmon_named("nvidia") + _hwmon_named("nouveau"))
+    if t is not None:
+        return int(round(t))
+    t = _thinkpad_ec_gpu_temp()
+    return int(round(t)) if t is not None else None
+
+
+def _read_nvml_temp():
+    """GPU temperature via the driver's own NVML library (no extra dependency).
+    Opened and closed around the read so a hybrid-graphics dGPU is never pinned
+    awake by this panel."""
+    try:
+        lib = ctypes.CDLL("libnvidia-ml.so.1")
+        if lib.nvmlInit_v2() != 0:
+            return None
+        try:
+            handle = ctypes.c_void_p()
+            if lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(handle)) != 0:
+                return None
+            value = ctypes.c_uint(0)
+            if lib.nvmlDeviceGetTemperature(handle, 0, ctypes.byref(value)) != 0:
+                return None
+            return float(value.value)
+        finally:
+            lib.nvmlShutdown()
+    except Exception:
+        return None
+
+
+def _thinkpad_ec_gpu_temp():
+    """The ThinkPad EC's 'GPU'-labelled sensor, where the model reports one."""
+    for d in _hwmon_named("thinkpad"):
+        for label_path in sorted(glob.glob(os.path.join(d, "temp*_label"))):
+            try:
+                with open(label_path) as f:
+                    if f.read().strip().upper() != "GPU":
+                        continue
+                with open(label_path.replace("_label", "_input")) as f:
+                    c = int(f.read().strip()) / 1000.0
+            except (OSError, ValueError):
+                continue
+            if 0 < c < 150:
+                return c
+    return None
+
+
+def read_fan_rpms():
+    """Every fan RPM the ThinkPad exposes. P1/P50-class models have two fans
+    with separate tachometers but one shared EC level, so both are shown while
+    control stays on the single /proc/acpi/ibm/fan level."""
+    for d in _hwmon_named("thinkpad"):
+        rpms = []
+        for inp in sorted(glob.glob(os.path.join(d, "fan*_input"))):
+            try:
+                with open(inp) as f:
+                    rpms.append(int(f.read().strip()))
+            except (OSError, ValueError):
+                pass
+        if rpms:
+            return rpms
+    return []
+
+
+def read_status():
+    """The daemon's latest snapshot, or None if it isn't running / is stale."""
+    try:
+        with open(STATUS_PATH) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if time.time() - data.get("updated", 0) > STATUS_MAX_AGE:
+        return None
+    return data
 
 
 def read_fan_proc():
@@ -295,6 +418,68 @@ class CurveCanvas(tk.Canvas):
         self.active = None
 
 
+class CurveEditor(ttk.Frame):
+    """Presets + draggable graph + numeric boxes for ONE temperature source.
+
+    Instantiated once per source (CPU, GPU) so each gets an independent curve;
+    the daemon runs both and obeys whichever asks for the most cooling.
+    """
+
+    def __init__(self, parent, temps, presets, on_change):
+        super().__init__(parent, padding=10)
+        self.presets = presets
+        self.on_change = on_change
+        self.vars = [tk.IntVar(value=t) for t in temps]
+
+        presetf = ttk.Frame(self)
+        presetf.grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(presetf, text="Preset:").grid(row=0, column=0, sticky="w")
+        for i, name in enumerate(presets):
+            ttk.Button(presetf, text=name, width=9,
+                       command=lambda n=name: self.apply_preset(n)).grid(
+                row=0, column=i + 1, padx=3)
+
+        ttk.Label(self, text="Drag a point to set the temperature at which "
+                             "each fan speed turns on:").grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(8, 4))
+
+        self.canvas = CurveCanvas(self, self.vars, on_change=on_change)
+        self.canvas.grid(row=2, column=0, columnspan=2, pady=(0, 6))
+
+        grid = ttk.Frame(self)
+        grid.grid(row=3, column=0, columnspan=2, sticky="w")
+        for lv in range(1, 8):
+            col = (lv - 1) % 4
+            r = 2 * ((lv - 1) // 4)
+            ttk.Label(grid, text=f"{int(round(lv / 7 * 100))}%").grid(row=r, column=col, padx=4)
+            ttk.Spinbox(grid, from_=TEMP_MIN, to=TEMP_MAX, width=4,
+                        textvariable=self.vars[lv - 1]).grid(
+                row=r + 1, column=col, padx=4, pady=(0, 6))
+        for var in self.vars:
+            var.trace_add("write", lambda *_a: self.canvas.redraw())
+
+        # Rows 4+ are left free for the caller to add per-source extras
+        # (the critical-temperature box, the GPU monitoring toggle).
+        self.extra = ttk.Frame(self)
+        self.extra.grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+    def apply_preset(self, name):
+        for var, t in zip(self.vars, self.presets[name]):
+            var.set(t)
+        if self.on_change:
+            self.on_change(f"Loaded '{name}' preset — press Apply.")
+
+    def set_temps(self, temps):
+        for var, t in zip(self.vars, temps):
+            var.set(t)
+
+    def temps(self):
+        return [v.get() for v in self.vars]
+
+    def set_enabled(self, enabled):
+        self.canvas.set_enabled(enabled)
+
+
 # --------------------------------------------------------------------------- #
 # GUI
 # --------------------------------------------------------------------------- #
@@ -319,18 +504,24 @@ class FanGUI:
         status.grid(row=0, column=0, sticky="ew", **pad)
 
         self.temp_var = tk.StringVar(value="--")
+        self.gpu_temp_var = tk.StringVar(value="--")
         self.rpm_var = tk.StringVar(value="--")
         self.level_var = tk.StringVar(value="--")
+        self.driver_var = tk.StringVar(value="--")
         self.daemon_var = tk.StringVar(value="checking…")
 
         ttk.Label(status, text="CPU temperature:").grid(row=0, column=0, sticky="w")
         ttk.Label(status, textvariable=self.temp_var, font=("", 14, "bold")).grid(row=0, column=1, sticky="w", padx=8)
-        ttk.Label(status, text="Fan speed:").grid(row=1, column=0, sticky="w")
-        ttk.Label(status, textvariable=self.rpm_var).grid(row=1, column=1, sticky="w", padx=8)
-        ttk.Label(status, text="Firmware level:").grid(row=2, column=0, sticky="w")
-        ttk.Label(status, textvariable=self.level_var).grid(row=2, column=1, sticky="w", padx=8)
-        ttk.Label(status, text="Daemon:").grid(row=3, column=0, sticky="w")
-        ttk.Label(status, textvariable=self.daemon_var).grid(row=3, column=1, sticky="w", padx=8)
+        ttk.Label(status, text="GPU temperature:").grid(row=1, column=0, sticky="w")
+        ttk.Label(status, textvariable=self.gpu_temp_var, font=("", 14, "bold")).grid(row=1, column=1, sticky="w", padx=8)
+        ttk.Label(status, text="Fan speed:").grid(row=2, column=0, sticky="w")
+        ttk.Label(status, textvariable=self.rpm_var).grid(row=2, column=1, sticky="w", padx=8)
+        ttk.Label(status, text="Firmware level:").grid(row=3, column=0, sticky="w")
+        ttk.Label(status, textvariable=self.level_var).grid(row=3, column=1, sticky="w", padx=8)
+        ttk.Label(status, text="Level requested by:").grid(row=4, column=0, sticky="w")
+        ttk.Label(status, textvariable=self.driver_var).grid(row=4, column=1, sticky="w", padx=8)
+        ttk.Label(status, text="Daemon:").grid(row=5, column=0, sticky="w")
+        ttk.Label(status, textvariable=self.daemon_var).grid(row=5, column=1, sticky="w", padx=8)
 
         # --- mode ------------------------------------------------------------
         modef = ttk.LabelFrame(leftcol, text="Mode", padding=10)
@@ -366,58 +557,55 @@ class FanGUI:
                    ).grid(row=3, column=1, sticky="w", pady=(6, 0), padx=6)
         self._update_manual_label()
 
-        # --- auto curve ------------------------------------------------------
+        # --- auto curves (one tab per temperature source) ---------------------
+        # The daemon runs BOTH curves and applies whichever asks for more
+        # cooling, so each source can be tuned independently.
         self.autof = ttk.LabelFrame(rightcol, text="Automatic curve", padding=10)
         self.autof.grid(row=0, column=0, sticky="ew", **pad)
-        presetf = ttk.Frame(self.autof)
-        presetf.grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Label(presetf, text="Preset:").grid(row=0, column=0, sticky="w")
-        for i, name in enumerate(PRESETS):
-            ttk.Button(presetf, text=name, width=9,
-                       command=lambda n=name: self._apply_preset(n)).grid(row=0, column=i + 1, padx=3)
+        # Called by the graph (no argument) and by the preset buttons (with
+        # their own message).
+        def edited(msg="Curve edited — press Apply."):
+            self.msg_var.set(msg)
 
-        # Build the per-level temperature variables first (the graph needs them).
-        self.level_temp_vars = []
-        curve_temps = self._curve_to_temps(self.cfg.get("curve"))
-        for lv in range(1, 8):
-            self.level_temp_vars.append(tk.IntVar(value=curve_temps[lv - 1]))
+        self.tabs = ttk.Notebook(self.autof)
+        self.tabs.grid(row=0, column=0, sticky="ew")
 
-        ttk.Label(self.autof, text="Drag a point to set the temperature at which "
-                                   "each fan speed turns on:").grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(8, 4))
-
-        # The draggable graph (X = fan %, Y = temperature).
-        self.curve_canvas = CurveCanvas(self.autof, self.level_temp_vars,
-                                        on_change=lambda: self.msg_var.set(
-                                            "Curve edited — press Apply."))
-        self.curve_canvas.grid(row=2, column=0, columnspan=2, pady=(0, 6))
-
-        # Numeric fine-tuning, kept in sync with the graph via variable traces.
-        grid = ttk.Frame(self.autof)
-        grid.grid(row=3, column=0, columnspan=2, sticky="w")
-        for lv in range(1, 8):
-            col = (lv - 1) % 4
-            r = 2 * ((lv - 1) // 4)
-            ttk.Label(grid, text=f"{int(round(lv / 7 * 100))}%").grid(row=r, column=col, padx=4)
-            sb = ttk.Spinbox(grid, from_=TEMP_MIN, to=TEMP_MAX, width=4,
-                             textvariable=self.level_temp_vars[lv - 1])
-            sb.grid(row=r + 1, column=col, padx=4, pady=(0, 6))
-        for var in self.level_temp_vars:
-            var.trace_add("write", lambda *_a: self.curve_canvas.redraw())
-
-        critf = ttk.Frame(self.autof)
-        critf.grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        ttk.Label(critf, text="Force full-speed at (°C):").grid(row=0, column=0, sticky="w")
+        self.cpu_editor = CurveEditor(self.tabs, self._curve_to_temps(self.cfg.get("curve")),
+                                      PRESETS, edited)
+        self.tabs.add(self.cpu_editor, text="  CPU  ")
+        ttk.Label(self.cpu_editor.extra, text="Force full-speed at (°C):").grid(
+            row=0, column=0, sticky="w")
         self.crit_var = tk.IntVar(value=self.cfg.get("critical_temp", 87))
-        ttk.Spinbox(critf, from_=60, to=90, width=4, textvariable=self.crit_var).grid(
-            row=0, column=1, padx=6)
-        ttk.Label(critf, text="Smooth temperature over (s):").grid(
+        ttk.Spinbox(self.cpu_editor.extra, from_=60, to=90, width=4,
+                    textvariable=self.crit_var).grid(row=0, column=1, padx=6)
+
+        self.gpu_editor = CurveEditor(
+            self.tabs, self._curve_to_temps(self.cfg.get("gpu_curve"), GPU_PRESETS),
+            GPU_PRESETS, edited)
+        self.tabs.add(self.gpu_editor, text="  GPU (NVIDIA)  ")
+        self.gpu_enabled_var = tk.BooleanVar(
+            value=self.cfg.get("gpu_monitoring", "auto") != "off")
+        ttk.Checkbutton(self.gpu_editor.extra, text="Include NVIDIA GPU temperature",
+                        variable=self.gpu_enabled_var).grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(self.gpu_editor.extra, text="Force full-speed at (°C):").grid(
             row=1, column=0, sticky="w", pady=(4, 0))
-        self.smooth_var = tk.IntVar(value=self.cfg.get("smoothing_seconds", 12))
-        ttk.Spinbox(critf, from_=0, to=60, width=4, textvariable=self.smooth_var).grid(
-            row=1, column=1, padx=6, pady=(4, 0))
-        ttk.Label(critf, text="(higher = steadier fan, ignores brief CPU spikes)",
+        self.gpu_crit_var = tk.IntVar(value=self.cfg.get("gpu_critical_temp", 90))
+        ttk.Spinbox(self.gpu_editor.extra, from_=60, to=95, width=4,
+                    textvariable=self.gpu_crit_var).grid(row=1, column=1, padx=6, pady=(4, 0))
+        self.gpu_state_var = tk.StringVar(value="")
+        ttk.Label(self.gpu_editor.extra, textvariable=self.gpu_state_var,
                   foreground="#666").grid(row=2, column=0, columnspan=2, sticky="w")
+
+        # Shared across both sources.
+        smoothf = ttk.Frame(self.autof)
+        smoothf.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(smoothf, text="Smooth temperature over (s):").grid(row=0, column=0, sticky="w")
+        self.smooth_var = tk.IntVar(value=self.cfg.get("smoothing_seconds", 12))
+        ttk.Spinbox(smoothf, from_=0, to=60, width=4, textvariable=self.smooth_var).grid(
+            row=0, column=1, padx=6)
+        ttk.Label(smoothf, text="(higher = steadier fan, ignores brief spikes)",
+                  foreground="#666").grid(row=1, column=0, columnspan=2, sticky="w")
 
         # --- settings --------------------------------------------------------
         setf = ttk.LabelFrame(rightcol, text="Settings", padding=10)
@@ -457,9 +645,9 @@ class FanGUI:
             self.autostart_var.set(autostart_enabled())
 
     # ----- helpers -------------------------------------------------------- #
-    def _curve_to_temps(self, curve):
+    def _curve_to_temps(self, curve, presets=PRESETS):
         """Convert stored curve [[t,lv]...] to per-level temps for levels 1..7."""
-        defaults = PRESETS["Balanced"]
+        defaults = presets["Balanced"]
         temps = dict()
         if isinstance(curve, list):
             for item in curve:
@@ -477,7 +665,8 @@ class FanGUI:
         auto_state = "normal" if mode == "auto" else "disabled"
         self._set_children_state(self.manualf, manual_state)
         self._set_children_state(self.autof, auto_state)
-        self.curve_canvas.set_enabled(mode == "auto")
+        self.cpu_editor.set_enabled(mode == "auto")
+        self.gpu_editor.set_enabled(mode == "auto")
 
     def _set_children_state(self, frame, state):
         for child in frame.winfo_children():
@@ -510,11 +699,6 @@ class FanGUI:
                 "It is meant for short bursts, not sustained use. Continue?"):
             self._set_special("disengaged")
 
-    def _apply_preset(self, name):
-        for var, t in zip(self.level_temp_vars, PRESETS[name]):
-            var.set(t)
-        self.msg_var.set(f"Loaded '{name}' preset — press Apply.")
-
     # ----- actions -------------------------------------------------------- #
     def _build_config(self):
         cfg = dict(self.cfg)
@@ -522,14 +706,19 @@ class FanGUI:
         if cfg["mode"] == "manual":
             cfg["manual_level"] = self.manual_choice
 
-        temps = [max(1, v.get()) for v in self.level_temp_vars]
-        temps = sorted(temps)  # keep thresholds monotonic
-        curve = [[0, 0]] + [[temps[lv - 1], lv] for lv in range(1, 8)]
-        cfg["curve"] = curve
+        cfg["curve"] = self._temps_to_curve(self.cpu_editor.temps())
+        cfg["gpu_curve"] = self._temps_to_curve(self.gpu_editor.temps())
         cfg["critical_temp"] = int(self.crit_var.get())
+        cfg["gpu_critical_temp"] = int(self.gpu_crit_var.get())
+        cfg["gpu_monitoring"] = "auto" if self.gpu_enabled_var.get() else "off"
         cfg["smoothing_seconds"] = int(self.smooth_var.get())
         cfg["rekick_seconds"] = 5 if self.rekick_var.get() else 0
         return cfg
+
+    @staticmethod
+    def _temps_to_curve(temps):
+        temps = sorted(max(1, t) for t in temps)   # keep thresholds monotonic
+        return [[0, 0]] + [[temps[lv - 1], lv] for lv in range(1, 8)]
 
     def apply(self):
         cfg = self._build_config()
@@ -552,26 +741,83 @@ class FanGUI:
         if ml.isdigit():
             self.scale.set(int(ml))
         self._update_manual_label()
-        for var, t in zip(self.level_temp_vars, self._curve_to_temps(self.cfg.get("curve"))):
-            var.set(t)
+        self.cpu_editor.set_temps(self._curve_to_temps(self.cfg.get("curve")))
+        self.gpu_editor.set_temps(
+            self._curve_to_temps(self.cfg.get("gpu_curve"), GPU_PRESETS))
         self.crit_var.set(self.cfg.get("critical_temp", 87))
+        self.gpu_crit_var.set(self.cfg.get("gpu_critical_temp", 90))
+        self.gpu_enabled_var.set(self.cfg.get("gpu_monitoring", "auto") != "off")
         self.smooth_var.set(self.cfg.get("smoothing_seconds", 12))
         self.rekick_var.set(self.cfg.get("rekick_seconds", 5) > 0)
         self._on_mode_change()
         self.msg_var.set("Reloaded from disk.")
 
     # ----- live refresh --------------------------------------------------- #
+    GPU_STATE_TEXT = {
+        "off": "GPU monitoring is switched off.",
+        "absent": "No NVIDIA GPU detected — this curve is unused.",
+        "asleep": "NVIDIA GPU is powered down (hybrid graphics) — left alone.",
+        "unavailable": "NVIDIA GPU temperature is currently unavailable.",
+        "ok": None,      # replaced with the backend name below
+    }
+
     def _refresh(self):
-        t = read_cpu_temp()
-        self.temp_var.set(f"{t} °C" if t is not None else "n/a")
+        # The daemon publishes what it actually decided; prefer that so the panel
+        # can never disagree with the fan. Fall back to reading sensors here.
+        st = read_status()
         speed, level = read_fan_proc()
-        self.rpm_var.set(f"{speed} RPM" if speed is not None else "n/a")
+        running = service_active()
+
+        t = st.get("cpu_temp") if st else read_cpu_temp()
+        self.temp_var.set(f"{t} °C" if t is not None else "n/a")
+
+        gpu_t = st.get("gpu_temp") if st else read_gpu_temp()
+        self.gpu_temp_var.set(f"{gpu_t} °C" if gpu_t is not None else "n/a")
+
+        rpms = (st.get("fan_rpm") if st else None) or read_fan_rpms()
+        if rpms:
+            self.rpm_var.set("  ·  ".join(f"fan{i}: {r} RPM"
+                                          for i, r in enumerate(rpms, 1)))
+        else:
+            self.rpm_var.set(f"{speed} RPM" if speed is not None else "n/a")
+
         self.level_var.set(level if level is not None else "n/a")
-        if service_active():
+
+        if st:
+            self.driver_var.set(self._driver_text(st))
+            state = st.get("gpu_state")
+            backend = st.get("gpu_backend")
+            text = self.GPU_STATE_TEXT.get(state, "")
+            if state == "ok":
+                text = f"Reading GPU temperature via {backend}."
+            self.gpu_state_var.set(text or "")
+        else:
+            # No snapshot: either the daemon is stopped, or it predates the
+            # status file. Either way these figures are read locally instead.
+            self.driver_var.set("n/a (no daemon status)" if running
+                                else "n/a (daemon not running)")
+            self.gpu_state_var.set("")
+
+        if running:
             self.daemon_var.set("● running")
         else:
             self.daemon_var.set("● not running (run the installer)")
         self.root.after(1500, self._refresh)
+
+    @staticmethod
+    def _driver_text(st):
+        """Which sensor asked for the level the daemon selected."""
+        source = st.get("source")
+        if st.get("critical"):
+            return f"{(source or '?').upper()} (critical override)"
+        if source is None:
+            return {"manual": "manual setting",
+                    "bios": "firmware"}.get(st.get("mode"), "—")
+        levels = {"cpu": st.get("cpu_level"), "gpu": st.get("gpu_level")}
+        other = "gpu" if source == "cpu" else "cpu"
+        if levels.get(other) is None:
+            return f"{source.upper()} (level {levels.get(source)})"
+        return (f"{source.upper()} (cpu {levels['cpu']} · gpu {levels['gpu']})")
 
 
 def main():
