@@ -25,6 +25,7 @@ rm -f /usr/share/applications/thinkpad-fan-control.desktop
 rm -f /usr/share/icons/hicolor/scalable/apps/thinkpad-fan-control.svg
 rm -f /usr/share/icons/hicolor/256x256/apps/thinkpad-fan-control.png
 rm -f /usr/share/pixmaps/thinkpad-fan-control.png
+rm -rf /run/thinkpad-fan
 
 # Remove the per-user "launch at login" entry, if present.
 REAL_USER="${SUDO_USER:-}"
