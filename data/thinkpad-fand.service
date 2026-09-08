@@ -6,6 +6,9 @@ After=multi-user.target
 [Service]
 Type=simple
 ExecStart=/usr/bin/thinkpad-fand
+# Status snapshot for the GUI: /run/thinkpad-fan/status.json
+RuntimeDirectory=thinkpad-fan
+RuntimeDirectoryMode=0755
 # Belt-and-suspenders: hand the fan back to firmware when the service stops.
 ExecStop=/bin/sh -c 'echo "level auto" > /proc/acpi/ibm/fan'
 Restart=on-failure

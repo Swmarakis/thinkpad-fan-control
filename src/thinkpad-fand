@@ -9,6 +9,16 @@ It reads a user-editable config file and applies one of three modes:
     manual  - hold a fixed level (0-7, full-speed, disengaged)
     auto    - temperature-based curve with hysteresis
 
+In auto mode every available temperature source (CPU, and optionally an NVIDIA
+GPU) runs its OWN curve, and the highest level any of them asks for wins:
+
+    fan_level = max(cpu_requested_level, gpu_requested_level)
+
+GPU support is entirely optional. A machine with no NVIDIA GPU, a powered-down
+hybrid-graphics dGPU, or a driver that is not loaded simply reads as "no GPU
+temperature", which is treated as "no cooling demand" - CPU control and every
+safety mechanism continue untouched.
+
 Safety design (see also the GUI):
   * A hardware watchdog is armed every loop. If this daemon dies, the firmware
     resumes automatic control within `watchdog` seconds - the fan can never get
@@ -16,23 +26,33 @@ Safety design (see also the GUI):
   * A critical-temperature override supersedes BOTH manual and auto modes: above
     `critical_temp` the fan is forced to full-speed no matter what the config says.
     This is what makes a user-writable config safe.
+  * The GPU has its own critical threshold (and its own hard cap), so a hot GPU
+    forces full-speed exactly like a hot CPU does.
   * On SIGTERM/SIGINT (and via systemd ExecStop) the fan is restored to firmware
     "auto" before exit.
 
 Config is distrusted on every read: values are clamped/validated, and a bad file
 falls back to the last known-good config.
+
+A snapshot of what the daemon is doing (temperatures, both fan tachometers, the
+chosen level and which sensor asked for it) is published to
+/run/thinkpad-fan/status.json for the GUI to read. It is best-effort: nothing in
+the control loop depends on it.
 """
 
+import ctypes
+import glob
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
-import glob
 from collections import deque
 
 FAN_PROC = "/proc/acpi/ibm/fan"
 CONFIG_PATH = "/etc/thinkpad-fan/config.json"
+STATUS_PATH = "/run/thinkpad-fan/status.json"
 
 VALID_MANUAL = {"0", "1", "2", "3", "4", "5", "6", "7", "full-speed", "disengaged"}
 
@@ -40,6 +60,7 @@ VALID_MANUAL = {"0", "1", "2", "3", "4", "5", "6", "7", "full-speed", "disengage
 WATCHDOG_SECONDS = 15        # firmware reclaims the fan this long after we stop talking
                              # (must stay > max poll_interval so it never expires while running)
 ABSOLUTE_CRITICAL = 90       # no matter the config, force full-speed at/above this
+GPU_ABSOLUTE_CRITICAL = 95   # same, for the GPU (GPUs are specified hotter than CPUs)
 
 DEFAULT_CONFIG = {
     "mode": "auto",
@@ -53,6 +74,14 @@ DEFAULT_CONFIG = {
                              # don't surge the fan on/off (0 = react instantly)
     "rekick_seconds": 5,     # if a commanded level stalls (>=1 but 0 RPM), re-kick it
                              # this often to keep airflow at low levels (0 = disabled)
+
+    # --- optional NVIDIA GPU source ---------------------------------------- #
+    "gpu_monitoring": "auto",  # "auto" (use it if present), "on" (warn if missing),
+                               # "off" (never look at the GPU at all)
+    # The GPU gets its own curve because GPUs idle cooler and are specified to run
+    # hotter than CPUs: cooling starts around 60 C and ramps hard past 80 C.
+    "gpu_curve": [[0, 0], [60, 1], [65, 2], [70, 3], [74, 4], [78, 5], [82, 6], [85, 7]],
+    "gpu_critical_temp": 90,   # force full-speed at/above this (clamped <= GPU_ABSOLUTE_CRITICAL)
 }
 
 
@@ -102,8 +131,342 @@ def read_cpu_temp():
         t = _collect_temps(_hwmon_dirs_named(name))
         if t is not None:
             return int(round(t))
-    t = _collect_temps(glob.glob("/sys/class/hwmon/hwmon*"))
+    # Last resort: any other hwmon device, minus the GPUs - those have their own
+    # curve, so feeding them into the CPU curve would be plain wrong.
+    rest = [d for d in glob.glob("/sys/class/hwmon/hwmon*")
+            if d not in _hwmon_dirs_named_any(GPU_HWMON_NAMES)]
+    t = _collect_temps(rest)
     return int(round(t)) if t is not None else None
+
+
+def read_fan_rpms():
+    """RPM of every fan the ThinkPad exposes a tachometer for.
+
+    P1/P50-class ThinkPads have two fans with separate tachometers
+    (fan1_input/fan2_input) but a SINGLE shared EC fan level, so we only read
+    them - control stays on /proc/acpi/ibm/fan. /proc's own 'speed:' line
+    reports just the first fan, hence going via hwmon here.
+    """
+    for d in _hwmon_dirs_named("thinkpad"):
+        rpms = []
+        for inp in sorted(glob.glob(os.path.join(d, "fan*_input"))):
+            try:
+                with open(inp) as f:
+                    rpms.append(int(f.read().strip()))
+            except (OSError, ValueError):
+                pass
+        if rpms:
+            return rpms
+    speed = read_fan_speed()
+    return [speed] if speed is not None else []
+
+
+# --------------------------------------------------------------------------- #
+# GPU temperature (optional - NVIDIA)
+#
+# Four ways of getting it, best first. Everything here is best-effort: any
+# failure just means "no GPU reading", never an exception reaching the loop.
+# --------------------------------------------------------------------------- #
+GPU_HWMON_NAMES = ("nvidia", "nouveau")
+NVML_TEMPERATURE_GPU = 0
+
+
+def _hwmon_dirs_named_any(names):
+    out = []
+    for name in names:
+        out.extend(_hwmon_dirs_named(name))
+    return out
+
+
+def nvidia_pci_devices():
+    """sysfs paths of NVIDIA display/3D PCI devices (empty if the machine has none).
+
+    Checked from sysfs rather than the driver so that a machine with no NVIDIA
+    hardware never loads a library or spawns a process.
+    """
+    out = []
+    for d in glob.glob("/sys/bus/pci/devices/*"):
+        try:
+            with open(os.path.join(d, "vendor")) as f:
+                if f.read().strip().lower() != "0x10de":
+                    continue
+            with open(os.path.join(d, "class")) as f:
+                cls = f.read().strip().lower()
+        except OSError:
+            continue
+        if cls.startswith("0x03"):        # 0x03xxxx = display controller
+            out.append(d)
+    return sorted(out)
+
+
+def nvidia_pci_awake(devices):
+    """True if at least one of `devices` is powered up.
+
+    On hybrid-graphics ThinkPads the dGPU runtime-suspends whenever nothing is
+    using it. Talking to the driver would wake it up and hold it awake, costing
+    battery for no benefit - a suspended GPU produces no heat. So we treat
+    "suspended" as "no reading" and leave it alone.
+    """
+    for d in devices:
+        try:
+            with open(os.path.join(d, "power", "runtime_status")) as f:
+                if f.read().strip() != "suspended":
+                    return True
+        except OSError:
+            return True                   # no runtime-PM info -> assume awake
+    return False
+
+
+class NvmlReader:
+    """GPU temperature straight from NVML (libnvidia-ml), via ctypes.
+
+    NVML is the driver's own management library, so this needs no third-party
+    Python module and no subprocess - it ships with every NVIDIA driver.
+
+    NVML is initialised and shut down around each read on purpose: holding a
+    device handle open pins a hybrid-graphics dGPU awake, which would stop it
+    ever runtime-suspending. A full cycle costs ~15 ms and only ever happens
+    while the GPU is already powered up.
+    """
+    SONAMES = ("libnvidia-ml.so.1", "libnvidia-ml.so")
+
+    def __init__(self):
+        self._lib = None
+
+    def _load(self):
+        if self._lib is None:
+            last = None
+            for name in self.SONAMES:
+                try:
+                    self._lib = ctypes.CDLL(name)
+                    break
+                except OSError as e:
+                    last = e
+            if self._lib is None:
+                raise OSError(f"NVML unavailable: {last}")
+        return self._lib
+
+    def read(self):
+        lib = self._load()
+        if lib.nvmlInit_v2() != 0:
+            return None
+        try:
+            count = ctypes.c_uint(0)
+            if lib.nvmlDeviceGetCount_v2(ctypes.byref(count)) != 0:
+                return None
+            temps = []
+            for i in range(count.value):
+                handle = ctypes.c_void_p()
+                if lib.nvmlDeviceGetHandleByIndex_v2(i, ctypes.byref(handle)) != 0:
+                    continue
+                value = ctypes.c_uint(0)
+                if lib.nvmlDeviceGetTemperature(handle, NVML_TEMPERATURE_GPU,
+                                                ctypes.byref(value)) == 0:
+                    temps.append(float(value.value))
+            return max(temps) if temps else None
+        finally:
+            lib.nvmlShutdown()
+
+
+def read_gpu_hwmon():
+    """GPU temperature from a GPU hwmon device (nouveau exposes one; the
+    proprietary driver generally does not)."""
+    return _collect_temps(_hwmon_dirs_named_any(GPU_HWMON_NAMES))
+
+
+def read_ec_gpu_temp():
+    """The ThinkPad EC's own 'GPU'-labelled sensor, where the model has one.
+
+    Plenty of ThinkPads leave it blank or report it only while the dGPU is
+    powered (the P1 Gen 7 does exactly that), so it reads as unavailable a lot -
+    which is fine, it is only reached when no NVIDIA driver interface answered.
+    """
+    for d in _hwmon_dirs_named("thinkpad"):
+        for label_path in sorted(glob.glob(os.path.join(d, "temp*_label"))):
+            try:
+                with open(label_path) as f:
+                    if f.read().strip().upper() != "GPU":
+                        continue
+                with open(label_path.replace("_label", "_input")) as f:
+                    celsius = int(f.read().strip()) / 1000.0
+            except (OSError, ValueError):
+                continue
+            if 0 < celsius < 150:
+                return celsius
+    return None
+
+
+def parse_nvidia_smi(text):
+    """Highest temperature in `nvidia-smi --query-gpu=temperature.gpu` output.
+
+    One line per GPU. Lines that aren't a number ('[N/A]', '[Not Supported]',
+    warnings) are skipped rather than trusted.
+    """
+    temps = []
+    for line in (text or "").splitlines():
+        try:
+            temps.append(float(line.strip()))
+        except ValueError:
+            continue
+    return max(temps) if temps else None
+
+
+def run_nvidia_smi():
+    """Spawn nvidia-smi once. Last resort: used only when no in-process
+    interface answered, and rate-limited by the caller."""
+    proc = subprocess.run(
+        ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5)
+    if proc.returncode != 0:
+        return None
+    return parse_nvidia_smi(proc.stdout.decode("utf-8", "replace"))
+
+
+class GpuTempSensor:
+    """Optional GPU temperature source.
+
+    read() never raises and never blocks for long. It returns a whole number of
+    degrees C, or None meaning "no GPU demand" - which is what a machine with no
+    NVIDIA GPU, a suspended dGPU, an unloaded driver or a broken sensor all look
+    like. The controller treats None as "this source asks for nothing", so CPU
+    control is completely unaffected.
+
+    Backends are tried best-first and the one that worked is remembered, so the
+    steady state is a single cheap call. A backend that fails is put on a short
+    cooldown, which is also what makes a GPU that comes back (driver reloaded,
+    dGPU woken) get picked up again automatically.
+    """
+    RETRY_SECONDS = 30       # cooldown before re-trying a backend that failed
+    SMI_MIN_INTERVAL = 5     # never spawn nvidia-smi more often than this
+    PROBE_SECONDS = 30       # how often to re-scan PCI for NVIDIA hardware
+
+    def __init__(self, backends=None, pci_devices=nvidia_pci_devices,
+                 pci_awake=nvidia_pci_awake, clock=time.monotonic):
+        self._nvml = NvmlReader()
+        # (name, needs_driver, read_fn). needs_driver backends are skipped
+        # unless an NVIDIA GPU is present AND powered up.
+        self.backends = backends if backends is not None else [
+            ("nvml", True, self._nvml.read),
+            ("hwmon", False, read_gpu_hwmon),
+            ("thinkpad-ec", False, read_ec_gpu_temp),
+            ("nvidia-smi", True, self._smi),
+        ]
+        self._pci_devices = pci_devices
+        self._pci_awake = pci_awake
+        self._clock = clock
+        self._cooldown = {}          # backend name -> time before which to skip it
+        self._devices = None
+        self._devices_checked = 0.0
+        self._smi_last = 0.0
+        self._smi_cached = None
+        self.state = "unknown"       # off | absent | asleep | unavailable | ok
+        self.backend = None          # name of the backend that last worked
+        self._crashed = False        # already logged an escaped exception?
+
+    # ----- internals ------------------------------------------------------- #
+    def _smi(self):
+        """nvidia-smi, rate-limited: between spawns the previous answer stands."""
+        now = self._clock()
+        if now - self._smi_last < self.SMI_MIN_INTERVAL:
+            return self._smi_cached
+        self._smi_last = now
+        self._smi_cached = run_nvidia_smi()
+        return self._smi_cached
+
+    def _nvidia_devices(self, now):
+        """PCI scan, refreshed occasionally so a hot-added/re-bound GPU shows up."""
+        if self._devices is None or now - self._devices_checked >= self.PROBE_SECONDS:
+            try:
+                self._devices = self._pci_devices()
+            except OSError:
+                self._devices = []
+            self._devices_checked = now
+        return self._devices
+
+    # ----- public ---------------------------------------------------------- #
+    def read(self, mode="auto"):
+        """Current GPU temperature in whole degrees C, or None.
+
+        The outer guard is deliberate belt-and-braces. Individual backends are
+        already wrapped below, but the GPU is an OPTIONAL extra: nothing on its
+        code path - including a bug in this class - may ever be able to take CPU
+        fan control down with it. Anything that escapes becomes "no reading".
+        """
+        try:
+            value = self._read(mode)
+        except Exception as e:                        # noqa: BLE001 - see above
+            if not self._crashed:                     # log once, not every poll
+                log(f"GPU sensor error ({e}); ignoring the GPU until it recovers")
+                self._crashed = True
+            self.state, self.backend = "unavailable", None
+            return None
+        self._crashed = False
+        return value
+
+    def _read(self, mode):
+        if mode == "off":
+            self.state, self.backend = "off", None
+            return None
+
+        now = self._clock()
+        devices = self._nvidia_devices(now)
+        driver_ok = bool(devices) and self._pci_awake(devices)
+
+        # Try the backend that worked last time first, then the rest in order.
+        order = sorted(self.backends, key=lambda b: b[0] != self.backend)
+        for name, needs_driver, fn in order:
+            if needs_driver and not driver_ok:
+                continue
+            if now < self._cooldown.get(name, 0.0):
+                continue
+            try:
+                value = fn()
+            except Exception as e:                    # noqa: BLE001 - a sensor
+                value = None                          # must never kill the daemon
+                self._cooldown[name] = now + self.RETRY_SECONDS
+                log(f"GPU sensor '{name}' failed ({e}); retrying in "
+                    f"{self.RETRY_SECONDS}s")
+            if value is None:
+                self._cooldown[name] = now + self.RETRY_SECONDS
+                continue
+            try:
+                celsius = float(value)
+            except (TypeError, ValueError):
+                self._cooldown[name] = now + self.RETRY_SECONDS
+                continue
+            if not 0 < celsius < 150:                 # implausible -> distrust it
+                self._cooldown[name] = now + self.RETRY_SECONDS
+                continue
+            self.backend = name
+            self._set_state("ok", mode)
+            return int(round(celsius))
+
+        # Nothing answered. Report WHY, so the GUI and the log can say something
+        # useful: no card at all, a card that is powered down, or a card that is
+        # there but not talking (driver gone, sensor failed, all backends on
+        # cooldown). All three mean the same thing to the controller: no demand.
+        self.backend = None
+        if not devices:
+            self._set_state("absent", mode)
+        elif not driver_ok:
+            self._set_state("asleep", mode)
+        else:
+            self._set_state("unavailable", mode)
+        return None
+
+    def _set_state(self, state, mode):
+        if state == self.state:
+            return
+        previous, self.state = self.state, state
+        if previous == "unknown" and state != "ok" and mode != "on":
+            return                                    # quiet on machines with no GPU
+        messages = {
+            "ok": f"GPU temperature available via {self.backend}",
+            "absent": "no NVIDIA GPU found; GPU monitoring idle",
+            "asleep": "NVIDIA GPU is powered down; ignoring it until it wakes",
+            "unavailable": "GPU temperature unavailable; CPU control continues",
+        }
+        log(messages.get(state, f"GPU sensor state: {state}"))
 
 
 # --------------------------------------------------------------------------- #
@@ -191,6 +554,28 @@ def _clamp(v, lo, hi, default):
     return max(lo, min(hi, v))
 
 
+def _validate_curve(raw_curve):
+    """Curve: list of [temp, level]. Clamp levels 0-7, temps 0-100, sort by temp,
+    drop duplicates, ensure a level-0 baseline."""
+    curve = []
+    if isinstance(raw_curve, list):
+        seen_temps = set()
+        for item in raw_curve:
+            try:
+                t = _clamp(item[0], 0, 100, 0)
+                lv = _clamp(item[1], 0, 7, 0)
+            except (TypeError, IndexError):
+                continue
+            if t in seen_temps:
+                continue
+            seen_temps.add(t)
+            curve.append([int(t), int(lv)])
+    curve.sort(key=lambda x: x[0])
+    if not curve or curve[0][0] != 0:
+        curve.insert(0, [0, 0])
+    return curve
+
+
 def validate_config(raw):
     """Return a sane config dict, clamping/repairing anything dubious."""
     cfg = dict(DEFAULT_CONFIG)
@@ -209,27 +594,15 @@ def validate_config(raw):
     cfg["smoothing_seconds"] = _clamp(raw.get("smoothing_seconds", 12), 0, 60, 12)
     cfg["rekick_seconds"] = _clamp(raw.get("rekick_seconds", 5), 0, 60, 5)
     cfg["critical_temp"] = _clamp(raw.get("critical_temp", 87), 60, ABSOLUTE_CRITICAL, 87)
+    cfg["curve"] = _validate_curve(raw.get("curve", cfg["curve"]))
 
-    # Curve: list of [temp, level]. Clamp levels 0-7, temps 0-100, sort by temp,
-    # drop duplicates, ensure a level-0 baseline.
-    curve = []
-    raw_curve = raw.get("curve", cfg["curve"])
-    if isinstance(raw_curve, list):
-        seen_temps = set()
-        for item in raw_curve:
-            try:
-                t = _clamp(item[0], 0, 100, 0)
-                lv = _clamp(item[1], 0, 7, 0)
-            except (TypeError, IndexError):
-                continue
-            if t in seen_temps:
-                continue
-            seen_temps.add(t)
-            curve.append([int(t), int(lv)])
-    curve.sort(key=lambda x: x[0])
-    if not curve or curve[0][0] != 0:
-        curve.insert(0, [0, 0])
-    cfg["curve"] = curve
+    # Optional GPU source. Absent keys keep the defaults above, so a config
+    # written before GPU support existed stays valid and simply gains them.
+    gm = raw.get("gpu_monitoring", cfg["gpu_monitoring"])
+    cfg["gpu_monitoring"] = gm if gm in ("auto", "on", "off") else "auto"
+    cfg["gpu_critical_temp"] = _clamp(raw.get("gpu_critical_temp", 90),
+                                      60, GPU_ABSOLUTE_CRITICAL, 90)
+    cfg["gpu_curve"] = _validate_curve(raw.get("gpu_curve", cfg["gpu_curve"]))
     return cfg
 
 
@@ -287,6 +660,89 @@ def curve_target_level(temp, prev_level, curve, hysteresis):
     return prev_level
 
 
+class Smoother:
+    """Rolling average of recent readings for one temperature source.
+
+    Averaging over `smoothing_seconds` stops brief turbo spikes surging the fan
+    on and off. A missing reading drains one sample instead of appending, so a
+    source that goes away (dGPU suspending, sensor unplugged) fades out over the
+    smoothing window and then reports None - it can never pin the fan at a level
+    with a stale value.
+    """
+
+    def __init__(self):
+        self.samples = deque()
+
+    def update(self, value, window):
+        window = max(1, int(window))
+        if self.samples.maxlen != window:
+            self.samples = deque(self.samples, maxlen=window)
+        if value is not None:
+            self.samples.append(value)
+        elif self.samples:
+            self.samples.popleft()
+        if not self.samples:
+            return None
+        return int(round(sum(self.samples) / len(self.samples)))
+
+
+def requested_levels(temps, prev_levels, cfg):
+    """The fan level each available temperature source is asking for.
+
+    `temps` maps source name -> smoothed temperature (None = no reading, which
+    contributes no request at all). Each source runs its own curve and keeps its
+    own hysteresis state, so the CPU stepping down never drags the GPU with it.
+    """
+    curves = {"cpu": cfg["curve"], "gpu": cfg["gpu_curve"]}
+    out = {}
+    for name, temp in temps.items():
+        if temp is None:
+            continue
+        out[name] = curve_target_level(temp, prev_levels.get(name, 0),
+                                       curves[name], cfg["hysteresis"])
+    return out
+
+
+def select_level(requests):
+    """(level, source) for the source asking for the most cooling.
+
+    Deliberately max() over the REQUESTED LEVELS rather than over the raw
+    temperatures, so CPU and GPU can have completely different curves. Ties go
+    to the CPU purely so the reported source is stable.
+    """
+    if not requests:
+        return None, None
+    source, level = max(requests.items(), key=lambda kv: (kv[1], kv[0] == "cpu"))
+    return level, source
+
+
+def critical_latch(temp, limit, engaged, release_margin=5):
+    """Latch the full-speed override on at/above `limit`, releasing it only once
+    the temperature is `release_margin` below - so it cannot flap at the edge.
+    An unknown temperature leaves the latch as it is (fail loud, not silent)."""
+    if temp is None:
+        return engaged
+    if temp >= limit:
+        return True
+    if temp <= limit - release_margin:
+        return False
+    return engaged
+
+
+def write_status(data, path=STATUS_PATH):
+    """Publish a snapshot for the GUI. Best-effort: the control loop does not
+    care whether this works."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.chmod(tmp, 0o644)              # the GUI runs as an ordinary user
+        os.replace(tmp, path)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
 # --------------------------------------------------------------------------- #
 # Main loop
 # --------------------------------------------------------------------------- #
@@ -318,11 +774,13 @@ def main():
     store.maybe_reload()
 
     log(f"started (dry_run={dry_run}); watchdog={WATCHDOG_SECONDS}s")
+    gpu = GpuTempSensor()     # optional; reads as None on machines without one
     prev_applied = None       # last command we intended / wrote
-    prev_level = 0            # last numeric level (for hysteresis), 0..7
-    force_active = False      # critical-temp override currently engaged?
+    prev_levels = {"cpu": 0, "gpu": 0}   # last level per source, for hysteresis
+    cpu_force = False         # critical-temp override currently engaged? (CPU)
+    gpu_force = False         # ... and the same for the GPU
     expected_readback = None  # what the firmware reports once our command settles
-    history = deque()         # recent raw temps, for smoothing the curve input
+    smoothers = {"cpu": Smoother(), "gpu": Smoother()}
     last_write = 0.0          # monotonic time of the last level write (for re-kick pacing)
     was_stalled = False       # currently in a stall-and-re-kick episode? (for tidy logging)
 
@@ -330,49 +788,57 @@ def main():
         store.maybe_reload()
         cfg = store.cfg
         temp = read_cpu_temp()
+        gpu_temp = gpu.read(cfg["gpu_monitoring"])
 
-        # Smooth the temperature the CURVE sees so brief CPU spikes don't surge
-        # the fan on/off. The safety override below still uses the RAW temp so it
-        # reacts instantly to genuinely dangerous spikes.
+        # Smooth the temperatures the CURVES see so brief spikes don't surge the
+        # fan on/off. The safety overrides below still use the RAW temps so they
+        # react instantly to genuinely dangerous spikes.
         window = max(1, round(cfg["smoothing_seconds"] / cfg["poll_interval"]))
-        if history.maxlen != window:
-            history = deque(history, maxlen=window)
-        if temp is not None:
-            history.append(temp)
-        avg_temp = int(round(sum(history) / len(history))) if history else None
+        avg_temp = smoothers["cpu"].update(temp, window)
+        gpu_avg = smoothers["gpu"].update(gpu_temp, window)
 
         # --- decide the command ---------------------------------------------
-        # Critical-temp override with hysteresis so it can't flap at the edge:
-        # engages at critical_temp, releases only once 5 C below it. Uses RAW temp.
-        if temp is not None:
-            if temp >= cfg["critical_temp"]:
-                force_active = True
-            elif temp <= cfg["critical_temp"] - 5:
-                force_active = False
+        # Critical-temp overrides with hysteresis so they can't flap at the edge:
+        # engage at the limit, release only once 5 C below it. Both use RAW temps.
+        cpu_force = critical_latch(temp, cfg["critical_temp"], cpu_force)
+        gpu_force = critical_latch(gpu_temp, cfg["gpu_critical_temp"], gpu_force)
+        if gpu_avg is None:
+            # The GPU has been unreadable for a whole smoothing window, i.e. it
+            # went away or powered down rather than glitched. Release its latch;
+            # a suspended GPU is cold, and it must not hold the fan at full speed
+            # forever. (The CPU latch deliberately does NOT do this: a laptop
+            # whose CPU sensor vanishes is better off loud than quiet.)
+            gpu_force = False
 
-        forced = False
-        if force_active:
+        requests = {}
+        forced_by = "cpu" if cpu_force else ("gpu" if gpu_force else None)
+        source = None
+        if cpu_force or gpu_force:
             command = "full-speed"
-            forced = True
         elif cfg["mode"] == "bios":
             command = "auto"
         elif cfg["mode"] == "manual":
             command = cfg["manual_level"]
             if command == "auto":      # 'auto' as a manual level == firmware auto
                 command = "auto"
-        else:  # auto curve
-            if avg_temp is None:
-                command = "auto"       # no reading -> safest is firmware auto
-            else:
-                lv = curve_target_level(avg_temp, prev_level, cfg["curve"], cfg["hysteresis"])
-                prev_level = lv
-                command = str(lv)
+        else:  # auto curve - every source runs its own curve, highest level wins
+            requests = requested_levels({"cpu": avg_temp, "gpu": gpu_avg},
+                                        prev_levels, cfg)
+            prev_levels.update(requests)     # each source keeps ITS OWN hysteresis
+            level, source = select_level(requests)
+            command = "auto" if level is None else str(level)   # no reading -> firmware auto
 
-        # Track numeric level for hysteresis continuity across mode switches.
-        if command.isdigit():
-            prev_level = int(command)
-        elif command in ("full-speed", "disengaged"):
-            prev_level = 7
+        # Outside the auto curve (manual level, BIOS, critical override) no source
+        # made a request, so seed every source's hysteresis state with the level
+        # actually applied - switching back to the curve then continues from where
+        # the fan really is instead of jumping. Never do this while the curve is
+        # running: it would overwrite a quiet source with the winning source's
+        # level and wrongly hold it there.
+        if not requests:
+            if command.isdigit():
+                prev_levels = {k: int(command) for k in prev_levels}
+            elif command in ("full-speed", "disengaged"):
+                prev_levels = {k: 7 for k in prev_levels}
 
         # --- apply -----------------------------------------------------------
         # Always re-arm the watchdog: it's a timer-only command that doesn't
@@ -391,17 +857,20 @@ def main():
         now = time.monotonic()
         intent_changed = command != prev_applied
         stall_kick = False
+        rpms = []
         if dry_run:
             do_write = intent_changed
         else:
+            rpms = read_fan_rpms()
             current = read_current_level()
             do_write = should_write(intent_changed, current, expected_readback)
             # Stall re-kick: we commanded a spinning level but the fan reads 0 RPM
             # (a low level the fan can't self-sustain). Re-issue it every
             # rekick_seconds to pulse some airflow. Levels that DO spin (RPM > 0)
             # never trigger this, so high speeds stay smooth - no wobble.
+            # On dual-fan models any fan still turning counts as "not stalled".
             stall_kick = should_rekick(do_write, cfg["rekick_seconds"], command,
-                                       read_fan_speed(), now - last_write)
+                                       max(rpms) if rpms else None, now - last_write)
 
         if do_write or stall_kick:
             set_level(command, dry_run)
@@ -409,9 +878,14 @@ def main():
             last_write = now
             if not dry_run:
                 expected_readback = read_current_level()
-            tstr = f"{temp}C" if temp is not None else "n/a"
+            tstr = f"cpu={temp}C" if temp is not None else "cpu=n/a"
             astr = f" avg={avg_temp}C" if avg_temp is not None else ""
-            extra = " [CRITICAL OVERRIDE]" if forced else ""
+            if gpu_temp is not None:
+                tstr += f" gpu={gpu_temp}C"
+            extra = f" [CRITICAL OVERRIDE: {forced_by}]" if forced_by else ""
+            if source is not None and len(requests) > 1:
+                extra += (" (requested by %s; cpu=%s gpu=%s)"
+                          % (source, requests.get("cpu", "-"), requests.get("gpu", "-")))
             if stall_kick:
                 if not was_stalled:      # log once per stall episode, not every pulse
                     log(f"level {command} stalled (0 RPM); re-kicking every "
@@ -420,9 +894,28 @@ def main():
             else:
                 was_stalled = False
                 reason = "" if intent_changed else " (re-asserting; firmware drifted)"
-                log(f"temp={tstr}{astr} mode={cfg['mode']} -> level {command}{extra}{reason}")
-        elif was_stalled and not dry_run and (read_fan_speed() or 0) > 0:
+                log(f"{tstr}{astr} mode={cfg['mode']} -> level {command}{extra}{reason}")
+        elif was_stalled and not dry_run and max(rpms or [0]) > 0:
             was_stalled = False          # fan recovered on its own
+
+        # --- publish a snapshot for the GUI (best-effort) --------------------
+        if not dry_run:
+            write_status({
+                "updated": time.time(),
+                "mode": cfg["mode"],
+                "level": command,
+                "source": forced_by or source,
+                "critical": bool(forced_by),
+                "cpu_temp": temp,
+                "cpu_avg": avg_temp,
+                "cpu_level": requests.get("cpu"),
+                "gpu_temp": gpu_temp,
+                "gpu_avg": gpu_avg,
+                "gpu_level": requests.get("gpu"),
+                "gpu_state": gpu.state,
+                "gpu_backend": gpu.backend,
+                "fan_rpm": rpms,
+            })
 
         # Sleep in small steps so we react to SIGTERM promptly.
         slept = 0.0
